@@ -12,6 +12,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import psycopg
+from psycopg import IsolationLevel
 
 
 @contextmanager
@@ -29,6 +30,34 @@ def source_connection(dsn: str):
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def source_snapshot_connection(dsn: str):
+    """Read-only, REPEATABLE READ connection yielding one catalog snapshot.
+
+    Every statement executed while the context is open sees the *same*
+    snapshot of ``pg_catalog``, so a multi-step catalog inspection (closure
+    graph, existence checks, full introspection) cannot mix structures from
+    two different DDL moments. The transaction is rolled back on exit: this
+    helper can never commit anything to the source database.
+    """
+    conn = psycopg.connect(dsn, connect_timeout=10)
+    try:
+        # Must be set before the first statement so psycopg applies them to
+        # the implicit transaction opened by the SET LOCAL statements below.
+        conn.isolation_level = IsolationLevel.REPEATABLE_READ
+        conn.read_only = True
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = '15s'")
+            cur.execute("SET LOCAL lock_timeout = '5s'")
+            cur.execute("SET LOCAL idle_in_transaction_session_timeout = '30s'")
+        yield conn
+    finally:
+        try:
+            conn.rollback()
+        finally:
+            conn.close()
 
 
 @contextmanager

@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from io import BytesIO
 
 from .config import settings
-from .db import source_connection
+from .compatibility import GenerationSnapshot, capture_snapshot
+from .db import source_snapshot_connection
 from .introspect import IntrospectionError, introspect_tables, read_fk_graph
 from .models import (
     ConflictReport,
@@ -32,6 +33,7 @@ class JobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, JobResult] = {}
         self._packages: dict[str, dict[str, str]] = {}
+        self._snapshots: dict[str, GenerationSnapshot] = {}
         self._lock = threading.Lock()
 
     def create(self) -> str:
@@ -50,6 +52,10 @@ class JobStore:
     def package(self, job_id: str) -> dict[str, str] | None:
         return self._packages.get(job_id)
 
+    def snapshot(self, job_id: str) -> GenerationSnapshot | None:
+        """Catalog snapshot the published package was rendered from."""
+        return self._snapshots.get(job_id)
+
     def update(self, job_id: str, **kw) -> None:
         with self._lock:
             job = self._jobs[job_id]
@@ -62,9 +68,17 @@ class JobStore:
             job = self._jobs[job_id]
             job.log.append(f"{datetime.now(timezone.utc).time().isoformat()} {line}")
 
-    def publish(self, job_id: str, package: dict[str, str]) -> None:
+    def publish(
+        self, job_id: str, package: dict[str, str], snapshot: GenerationSnapshot
+    ) -> None:
+        """Expose a package together with the snapshot it was generated from.
+
+        Package and snapshot are stored atomically: a published package can
+        always be checked against the exact structure that produced it.
+        """
         with self._lock:
             self._packages[job_id] = package
+            self._snapshots[job_id] = snapshot
 
     def purge_expired(self) -> None:
         now = time.time()
@@ -78,6 +92,7 @@ class JobStore:
             for jid in stale:
                 self._jobs.pop(jid, None)
                 self._packages.pop(jid, None)
+                self._snapshots.pop(jid, None)
 
 
 STORE = JobStore()
@@ -111,8 +126,14 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
     store = STORE
     try:
         store.update(job_id, status=JobStatus.GENERATING)
-        store.append_log(job_id, "opening read-only source connection (catalogs only)")
-        with source_connection(settings.source_dsn) as conn:
+        store.append_log(
+            job_id,
+            "opening read-only source connection (catalogs only, single snapshot)",
+        )
+        # One REPEATABLE READ transaction covers the closure expansion, the
+        # existence checks and the full introspection: the snapshot used for
+        # generation is internally consistent even if DDL lands concurrently.
+        with source_snapshot_connection(settings.source_dsn) as conn:
             requested = req.table_names()
 
             # Step 1: compute the FK closure by expanding the catalog FK graph
@@ -217,6 +238,11 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
                 schema_name=req.schema_name,
                 tables=[spec_by_name[t] for t in selected],
             )
+            # Freeze the exact structures this package will be rendered from;
+            # it is published atomically with the package after verification.
+            snapshot = capture_snapshot(
+                req.schema_name, requested, selected, schemas
+            )
 
         specs = {s.table: s for s in req.tables}
 
@@ -275,7 +301,7 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
             return
 
         # Only now is the package stored and downloadable.
-        store.publish(job_id, package)
+        store.publish(job_id, package, snapshot)
         store.append_log(job_id, "package verified and published")
         store.update(job_id, status=JobStatus.SUCCEEDED)
     except Exception as exc:  # defensive: never leave a job dangling

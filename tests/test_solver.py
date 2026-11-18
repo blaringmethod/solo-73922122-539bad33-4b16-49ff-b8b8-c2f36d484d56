@@ -242,43 +242,35 @@ def test_match_simple_allows_mixed_null():
 
 def test_match_simple_vs_full_mixed_null_distinction():
     """A scenario feasible only if mixed NULL composite keys are allowed."""
-    # Child has more rows than the parent has distinct full keys, and the
-    # non-null intervals cannot supply enough distinct full keys; mixed-NULL
-    # rows provide the extra capacity under SIMPLE but are banned under FULL.
-    parent, child_simple = _composite_table(MatchType.SIMPLE)
-    _, child_full = _composite_table(MatchType.FULL)
-    # f1 single-point, f2 single-point => at most one distinct non-NULL key.
-    tight = {
+    # Parent has a single key. The child needs 4 rows whose (f1, f2) must be
+    # unique, but f1's interval is a single point (1) and f2 is NOT NULL with
+    # a single-point interval (10), so at most one non-NULL key exists.
+    # Additional rows therefore need f1 = NULL: SIMPLE admits that mixed key
+    # (and SQL UNIQUE treats NULL-bearing keys as distinct), whereas FULL
+    # forbids mixed NULLs and all-NULL is impossible (f2 NOT NULL) => unsat.
+    def build(match):
+        parent, child = _composite_table(match)
+        child.columns[2].nullable = False  # f2 NOT NULL
+        child.unique_constraints.append(
+            UniqueConstraint(name="uk_f1f2", columns=["f1", "f2"], is_primary=False)
+        )
+        return parent, child
+
+    specs = {
         "p": spec("p", 1, {"k1": (1, 1), "k2": (10, 10)}),
-        "c": spec("c", 3, {"id": (100, 102), "f1": (1, 1), "f2": (10, 10)}),
-    }
-    # FULL: every non-all-NULL row must match the single parent key; that is
-    # still feasible without NULLs, so instead force NULL usage via a unique
-    # index on the FK columns to expose the distinction.
-    child_simple.unique_constraints.append(
-        UniqueConstraint(name="uk_fk", columns=["f1", "f2"], is_primary=False)
-    )
-    child_full.unique_constraints.append(
-        UniqueConstraint(name="uk_fk", columns=["f1", "f2"], is_primary=False)
-    )
-    need_null = {
-        "p": spec("p", 1, {"k1": (1, 1), "k2": (10, 10)}),
-        # 4 child rows but only one non-NULL distinct (f1,f2); the rest must be
-        # NULL-bearing. SIMPLE permits mixed (f1=NULL,f2=10); FULL does not.
         "c": spec("c", 4, {"id": (100, 103), "f1": (1, 1), "f2": (10, 10)}),
     }
-    simple_out = Generator({"p": parent, "c": child_simple}, need_null).solve()
+
+    parent, child_simple = build(MatchType.SIMPLE)
+    simple_out = Generator({"p": parent, "c": child_simple}, specs).solve()
     mixed_seen = any(
         (r["f1"] is None) != (r["f2"] is None) for r in simple_out["c"]
     )
     assert mixed_seen, "MATCH SIMPLE should admit a mixed-NULL composite key"
 
-    # Under FULL the same request must be unsat: FULL only allows all-NULL keys
-    # (which satisfy the unique index via NULL-distinctness) — verify FULL never
-    # emits a mixed key even when it finds a solution.
-    full_out = Generator({"p": parent, "c": child_full}, tight).solve()
-    for r in full_out["c"]:
-        assert (r["f1"] is None) == (r["f2"] is None)
+    parent, child_full = build(MatchType.FULL)
+    with pytest.raises(Unsatisfiable):
+        Generator({"p": parent, "c": child_full}, specs).solve()
 
 
 def test_zero_rows_table():

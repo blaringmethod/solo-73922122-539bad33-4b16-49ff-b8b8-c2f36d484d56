@@ -154,3 +154,62 @@ class JobResult(BaseModel):
     conflict: ConflictReport | None = None
     log: list[str] = Field(default_factory=list)
     selected_tables: list[str] = Field(default_factory=list)
+
+
+class CompatibilityVerdict(str, Enum):
+    """Outcome of comparing a job's generation snapshot with the live source.
+
+    ``APPLICABLE`` is only ever returned after a successful, complete
+    comparison. Every uncertain situation (unreadable source, unsupported or
+    missing structure, non-successful job) has its own non-applicable value.
+    """
+
+    APPLICABLE = "applicable"
+    CHANGED = "changed"
+    TABLE_MISSING = "table_missing"
+    STRUCTURE_UNSUPPORTED = "structure_unsupported"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+    JOB_NOT_SUCCESSFUL = "job_not_successful"
+    SNAPSHOT_MISSING = "snapshot_missing"
+
+
+class SchemaChange(BaseModel):
+    """One detected structural difference between snapshot and current source."""
+
+    kind: str
+    object: str
+    detail: str
+
+
+class UnsupportedObject(BaseModel):
+    """Current source object outside the supported feature set."""
+
+    object: str
+    reason: str
+
+
+class GenerationSnapshotInfo(BaseModel):
+    """Metadata of the catalog snapshot captured when the package was made."""
+
+    captured_at: str
+    schema_name: str
+    requested_tables: list[str]
+    selected_tables: list[str]
+
+
+class CompatibilityReport(BaseModel):
+    job_id: str
+    job_status: str
+    applicable: bool
+    verdict: CompatibilityVerdict
+    reason: str
+    checked_at: str
+    schema_name: str
+    snapshot: GenerationSnapshotInfo | None = None
+    current_closure: list[str] | None = None
+    changes: list[SchemaChange] = Field(default_factory=list)
+    unsupported: list[UnsupportedObject] = Field(default_factory=list)
+    # The check is a pure read: neither the published package nor the job's
+    # download availability is touched.
+    package_modified: bool = False
+    download_status_modified: bool = False

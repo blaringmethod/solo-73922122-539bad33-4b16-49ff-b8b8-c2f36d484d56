@@ -52,6 +52,7 @@ docker compose up --build
 | GET | `/schemas/{schema}/tables/{table}/structure` | 支持的结构视图；不支持时返回 422 与拒绝原因 |
 | POST | `/jobs` | 提交生成+验证作业（后台执行），返回 `job_id` |
 | GET | `/jobs/{job_id}` | 状态、无解冲突报告、逐步日志 |
+| GET | `/jobs/{job_id}/schema-compatibility` | 对照生成时的结构快照与当前源库，判断原包是否仍适用 |
 | GET | `/jobs/{job_id}/download` | 仅在验证成功后下载 zip（含 5 个文件） |
 
 ### 请求体
@@ -98,6 +99,57 @@ psql "$EMPTY_DATABASE_DSN" -v ON_ERROR_STOP=1 \
   -f 01_schema.sql -f 02_data.sql -f 03_constraints.sql
 ```
 
+### 沿用检验样本前的结构适用性核查
+
+装载回归要沿用某个成功作业的样本时，源表结构可能已经变化。核查接口：
+
+```bash
+curl http://localhost:8000/jobs/$JOB_ID/schema-compatibility
+```
+
+```json
+{
+  "job_id": "...",
+  "job_status": "SUCCEEDED",
+  "applicable": false,
+  "verdict": "changed",
+  "reason": "对照生成时的结构快照检测到 2 处变化（列类型、外键），原 SQL 包不再与当前源表结构一致，建议重新生成后使用。",
+  "schema_name": "public",
+  "snapshot": {
+    "captured_at": "...",
+    "schema_name": "public",
+    "requested_tables": ["project"],
+    "selected_tables": ["project", "dept", "employee"]
+  },
+  "current_closure": ["project", "dept", "employee"],
+  "changes": [
+    {"kind": "column_type", "object": "public.employee.level",
+     "detail": "列类型由 smallint 变为 bigint"},
+    {"kind": "foreign_key", "object": "public.project.project_dept_fk",
+     "detail": "外键列 (dept_id, dept_code) 的匹配方式由 MATCH FULL 变为 MATCH SIMPLE"}
+  ],
+  "unsupported": [],
+  "package_modified": false,
+  "download_status_modified": false
+}
+```
+
+判定规则：
+
+- 生成时：闭包扩展 + 存在性检查 + 完整内省在**同一个 `REPEATABLE READ` 只读事务**
+  内完成，作业随包一起保存该目录快照；核查时同样以**一个** `REPEATABLE READ`
+  只读事务读取当前目录（存在性、内省、闭包一致）。两次各以一致的快照为准。
+- 只有当前结构与快照逐项一致才返回 `applicable=true`；以下任一变化都判为不适用：
+  列类型、列可空性、列增删、主键/唯一键（含列组成）、外键的本地列/目标表/被引用列/
+  `MATCH` 方式/`ON UPDATE`/`ON DELETE`/可延迟性，以及**新外键把闭包扩展到包外的新表**。
+- 分别给出明确结论而非"未知即适用"：`table_missing`（表已删除）、
+  `structure_unsupported`（当前结构含不受支持的对象，附 `unsupported` 清单）、
+  `source_unavailable`（源库读取失败，`reason` 带错误）。
+- 未成功作业一律 `job_not_successful`，不给出适用结论；快照已被回收为
+  `snapshot_missing`。两者均 `applicable=false`。
+- 核查是纯读操作：不修改原包内容、不影响下载状态（响应中两个 `*_modified` 均为
+  `false`），源库只读且只查 `pg_catalog`，不读任何表行。
+
 ## 循环引用检验表示例
 
 `sql/00_demo_source_schema.sql` 构成如下循环图（全部整数列、零行）：
@@ -136,9 +188,9 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/
 ## 目录结构
 
 ```
-app/            FastAPI + 内省 + z3 求解 + SQL 渲染 + 隔离库验证
+app/            FastAPI + 内省 + z3 求解 + SQL 渲染 + 隔离库验证 + 结构适用性核查
 sql/            循环引用检验表源结构、源库初始化（只读角色）
 examples/       循环四表、无解冲突、闭包扩展三类请求示例
-tests/          34 个单元/集成/端到端测试（真实 PostgreSQL）
+tests/          单元/集成/端到端测试（真实 PostgreSQL），含结构变化与读取失败核查
 docker-compose.yml / Dockerfile / requirements.txt
 ```

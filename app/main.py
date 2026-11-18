@@ -8,6 +8,8 @@ GET  /schemas/{schema}/tables/{table}/structure
                               full supported-structure view + rejections
 POST /jobs                    create a generation/verification job
 GET  /jobs/{job_id}           status, conflict report, logs
+GET  /jobs/{job_id}/schema-compatibility
+                              compare generation snapshot with current source
 GET  /jobs/{job_id}/download  zip package, available only after SUCCEEDED
 GET  /docs                    OpenAPI Swagger UI
 """
@@ -18,6 +20,7 @@ from contextlib import asynccontextmanager
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
 
+from .compatibility import check_compatibility
 from .config import settings
 from .db import source_connection
 from .introspect import (
@@ -26,7 +29,7 @@ from .introspect import (
     list_base_tables,
 )
 from .jobs import STORE, package_zip, run_job
-from .models import GenerateRequest, JobStatus
+from .models import CompatibilityReport, GenerateRequest, JobStatus
 
 
 @asynccontextmanager
@@ -112,6 +115,37 @@ def get_job(job_id: str):
     if job is None:
         raise HTTPException(404, "job 不存在或已过期")
     return job.model_dump()
+
+
+@app.get(
+    "/jobs/{job_id}/schema-compatibility",
+    tags=["jobs"],
+    response_model=CompatibilityReport,
+    responses={
+        404: {"description": "job 不存在或已过期"},
+        200: {
+            "description": (
+                "适用性结论。verdict 取值：applicable / changed / table_missing / "
+                "structure_unsupported / source_unavailable / job_not_successful / "
+                "snapshot_missing；仅 applicable 时 applicable=true。"
+            )
+        },
+    },
+)
+def job_schema_compatibility(job_id: str):
+    """Compare the generation-time catalog snapshot with the current source.
+
+    Read-only: no table rows are read, and neither the published package nor
+    the job's download state is modified. A source read failure yields
+    ``source_unavailable`` (never ``applicable``); a non-successful job is
+    reported as ``job_not_successful``.
+    """
+    job = STORE.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job 不存在或已过期")
+    return check_compatibility(
+        job, STORE.snapshot(job_id), settings.source_dsn
+    ).model_dump()
 
 
 @app.get("/jobs/{job_id}/download", tags=["jobs"])
